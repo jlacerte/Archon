@@ -16,21 +16,30 @@ Usage:
 from typing import Optional
 import logging
 import os
+import threading
 
 from archon.domain import ISitePagesRepository, IEmbeddingService
 
 logger = logging.getLogger("archon.container")
 
+# Valid configuration values (for validation)
+VALID_REPOSITORY_TYPES = frozenset({"supabase", "postgres", "memory"})
+VALID_EMBEDDING_TYPES = frozenset({"openai", "mock"})
+
 # Configuration globale - valeurs par defaut
 # Note: la variable REPOSITORY_TYPE est lue au runtime dans get_repository()
 _config = {
     "repository_type": None,  # None = use REPOSITORY_TYPE env var, or "supabase" | "postgres" | "memory"
-    "embedding_type": "openai",              # "openai" | "mock"
+    "embedding_type": None,   # None = use EMBEDDING_SERVICE_TYPE env var, or "openai" | "mock"
 }
 
 # Instances singleton (lazy)
 _repository_instance: Optional[ISitePagesRepository] = None
 _embedding_instance: Optional[IEmbeddingService] = None
+
+# Thread safety locks for singleton initialization
+_repository_lock = threading.Lock()
+_embedding_lock = threading.Lock()
 
 
 def configure(
@@ -43,15 +52,30 @@ def configure(
     Args:
         repository_type: "supabase", "postgres", ou "memory"
         embedding_type: "openai" ou "mock"
+
+    Raises:
+        ValueError: If repository_type or embedding_type is invalid
     """
     global _repository_instance, _embedding_instance
 
     if repository_type is not None:
+        # Validate repository_type early for better error messages
+        if repository_type not in VALID_REPOSITORY_TYPES:
+            raise ValueError(
+                f"Invalid repository_type: '{repository_type}'. "
+                f"Valid values: {', '.join(sorted(VALID_REPOSITORY_TYPES))}"
+            )
         logger.info(f"Configuring repository_type: {repository_type}")
         _config["repository_type"] = repository_type
         _repository_instance = None  # Reset instance
 
     if embedding_type is not None:
+        # Validate embedding_type early for better error messages
+        if embedding_type not in VALID_EMBEDDING_TYPES:
+            raise ValueError(
+                f"Invalid embedding_type: '{embedding_type}'. "
+                f"Valid values: {', '.join(sorted(VALID_EMBEDDING_TYPES))}"
+            )
         logger.info(f"Configuring embedding_type: {embedding_type}")
         _config["embedding_type"] = embedding_type
         _embedding_instance = None  # Reset instance
@@ -69,60 +93,66 @@ def get_repository() -> ISitePagesRepository:
     """
     global _repository_instance
 
+    # Double-checked locking pattern for thread safety
     if _repository_instance is None:
-        # Read repo_type from config, fallback to env var, default to supabase
-        repo_type = _config["repository_type"]
-        if repo_type is None:
-            repo_type = os.environ.get("REPOSITORY_TYPE", "supabase")
-        logger.debug(f"Creating repository instance: {repo_type}")
+        with _repository_lock:
+            # Check again after acquiring lock (another thread may have created it)
+            if _repository_instance is not None:
+                return _repository_instance
 
-        if repo_type == "supabase":
-            # Import lazy pour eviter les dependances circulaires
-            from utils.utils import get_supabase_client
-            from archon.infrastructure.supabase import SupabaseSitePagesRepository
+            # Read repo_type from config, fallback to env var, default to supabase
+            repo_type = _config["repository_type"]
+            if repo_type is None:
+                repo_type = os.environ.get("REPOSITORY_TYPE", "supabase")
+            logger.debug(f"Creating repository instance: {repo_type}")
 
-            supabase_client = get_supabase_client()
-            if supabase_client is None:
-                raise ValueError(
-                    "Supabase client not available. "
-                    "Please configure SUPABASE_URL and SUPABASE_SERVICE_KEY in environment."
+            if repo_type == "supabase":
+                # Import lazy pour eviter les dependances circulaires
+                from utils.utils import get_supabase_client
+                from archon.infrastructure.supabase import SupabaseSitePagesRepository
+
+                supabase_client = get_supabase_client()
+                if supabase_client is None:
+                    raise ValueError(
+                        "Supabase client not available. "
+                        "Please configure SUPABASE_URL and SUPABASE_SERVICE_KEY in environment."
+                    )
+                _repository_instance = SupabaseSitePagesRepository(supabase_client)
+                logger.info("Created SupabaseSitePagesRepository instance")
+
+            elif repo_type == "postgres":
+                # PostgreSQL direct with asyncpg + pgvector
+                from archon.infrastructure.postgres import PostgresSitePagesRepository, create_pool
+
+                # Get PostgreSQL configuration from environment
+                postgres_config = {
+                    "host": os.environ.get("POSTGRES_HOST", "localhost"),
+                    "port": int(os.environ.get("POSTGRES_PORT", "5432")),
+                    "database": os.environ.get("POSTGRES_DB", "archon"),
+                    "user": os.environ.get("POSTGRES_USER", "postgres"),
+                    "password": os.environ.get("POSTGRES_PASSWORD", ""),
+                }
+
+                # Create pool and repository synchronously
+                # Note: Pool creation must be done in an async context
+                # So we raise an error with instructions
+                raise RuntimeError(
+                    "PostgreSQL repository requires async initialization. "
+                    "Use get_repository_async() instead, or initialize manually:\n\n"
+                    "  from archon.infrastructure.postgres import PostgresSitePagesRepository\n"
+                    "  repo = await PostgresSitePagesRepository.create(**config)\n"
+                    "  from archon.container import override_repository\n"
+                    "  override_repository(repo)\n"
                 )
-            _repository_instance = SupabaseSitePagesRepository(supabase_client)
-            logger.info("Created SupabaseSitePagesRepository instance")
 
-        elif repo_type == "postgres":
-            # PostgreSQL direct with asyncpg + pgvector
-            from archon.infrastructure.postgres import PostgresSitePagesRepository, create_pool
+            elif repo_type == "memory":
+                from archon.infrastructure.memory import InMemorySitePagesRepository
 
-            # Get PostgreSQL configuration from environment
-            postgres_config = {
-                "host": os.environ.get("POSTGRES_HOST", "localhost"),
-                "port": int(os.environ.get("POSTGRES_PORT", "5432")),
-                "database": os.environ.get("POSTGRES_DB", "archon"),
-                "user": os.environ.get("POSTGRES_USER", "postgres"),
-                "password": os.environ.get("POSTGRES_PASSWORD", ""),
-            }
+                _repository_instance = InMemorySitePagesRepository()
+                logger.info("Created InMemorySitePagesRepository instance")
 
-            # Create pool and repository synchronously
-            # Note: Pool creation must be done in an async context
-            # So we raise an error with instructions
-            raise RuntimeError(
-                "PostgreSQL repository requires async initialization. "
-                "Use get_repository_async() instead, or initialize manually:\n\n"
-                "  from archon.infrastructure.postgres import PostgresSitePagesRepository\n"
-                "  repo = await PostgresSitePagesRepository.create(**config)\n"
-                "  from archon.container import override_repository\n"
-                "  override_repository(repo)\n"
-            )
-
-        elif repo_type == "memory":
-            from archon.infrastructure.memory import InMemorySitePagesRepository
-
-            _repository_instance = InMemorySitePagesRepository()
-            logger.info("Created InMemorySitePagesRepository instance")
-
-        else:
-            raise ValueError(f"Unknown repository type: {repo_type}")
+            else:
+                raise ValueError(f"Unknown repository type: {repo_type}")
 
     return _repository_instance
 
@@ -201,32 +231,41 @@ def get_embedding_service() -> IEmbeddingService:
     """
     global _embedding_instance
 
+    # Double-checked locking pattern for thread safety
     if _embedding_instance is None:
-        embed_type = _config["embedding_type"]
-        logger.debug(f"Creating embedding service instance: {embed_type}")
+        with _embedding_lock:
+            # Check again after acquiring lock (another thread may have created it)
+            if _embedding_instance is not None:
+                return _embedding_instance
 
-        if embed_type == "openai":
-            from utils.utils import get_openai_client
-            from archon.infrastructure.openai import OpenAIEmbeddingService
+            # Read embed_type from config, fallback to env var, default to openai
+            embed_type = _config["embedding_type"]
+            if embed_type is None:
+                embed_type = os.environ.get("EMBEDDING_SERVICE_TYPE", "openai")
+            logger.debug(f"Creating embedding service instance: {embed_type}")
 
-            embedding_client = get_openai_client()
-            if embedding_client is None:
-                raise ValueError(
-                    "OpenAI client not available. "
-                    "Please configure EMBEDDING_API_KEY in environment."
-                )
-            _embedding_instance = OpenAIEmbeddingService(embedding_client)
-            logger.info("Created OpenAIEmbeddingService instance")
+            if embed_type == "openai":
+                from utils.utils import get_openai_client
+                from archon.infrastructure.openai import OpenAIEmbeddingService
 
-        elif embed_type == "mock":
-            # Pour les tests - retourne des embeddings factices
-            from archon.infrastructure.memory import MockEmbeddingService
+                embedding_client = get_openai_client()
+                if embedding_client is None:
+                    raise ValueError(
+                        "OpenAI client not available. "
+                        "Please configure EMBEDDING_API_KEY in environment."
+                    )
+                _embedding_instance = OpenAIEmbeddingService(embedding_client)
+                logger.info("Created OpenAIEmbeddingService instance")
 
-            _embedding_instance = MockEmbeddingService()
-            logger.info("Created MockEmbeddingService instance")
+            elif embed_type == "mock":
+                # Pour les tests - retourne des embeddings factices
+                from archon.infrastructure.memory import MockEmbeddingService
 
-        else:
-            raise ValueError(f"Unknown embedding type: {embed_type}")
+                _embedding_instance = MockEmbeddingService()
+                logger.info("Created MockEmbeddingService instance")
+
+            else:
+                raise ValueError(f"Unknown embedding type: {embed_type}")
 
     return _embedding_instance
 

@@ -121,21 +121,7 @@ def get_repository() -> ISitePagesRepository:
                 logger.info("Created SupabaseSitePagesRepository instance")
 
             elif repo_type == "postgres":
-                # PostgreSQL direct with asyncpg + pgvector
-                from archon.infrastructure.postgres import PostgresSitePagesRepository, create_pool
-
-                # Get PostgreSQL configuration from environment
-                postgres_config = {
-                    "host": os.environ.get("POSTGRES_HOST", "localhost"),
-                    "port": int(os.environ.get("POSTGRES_PORT", "5432")),
-                    "database": os.environ.get("POSTGRES_DB", "archon"),
-                    "user": os.environ.get("POSTGRES_USER", "postgres"),
-                    "password": os.environ.get("POSTGRES_PASSWORD", ""),
-                }
-
-                # Create pool and repository synchronously
-                # Note: Pool creation must be done in an async context
-                # So we raise an error with instructions
+                # PostgreSQL requires async initialization - guide user to async path
                 raise RuntimeError(
                     "PostgreSQL repository requires async initialization. "
                     "Use get_repository_async() instead, or initialize manually:\n\n"

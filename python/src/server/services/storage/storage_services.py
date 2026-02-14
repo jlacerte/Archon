@@ -206,8 +206,10 @@ class DocumentStorageService(BaseStorageService):
 
                 result = {
                     "chunks_stored": len(chunks),
+                    "chunks_embedded": len(chunks),  # All chunks get embeddings
                     "code_examples_stored": code_examples_count,
-                    "total_word_count": total_word_count,
+                    "word_count": total_word_count,  # API expects "word_count"
+                    "total_word_count": total_word_count,  # Keep for backwards compat
                     "source_id": source_id,
                     "filename": filename,
                 }

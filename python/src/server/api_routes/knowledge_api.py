@@ -180,6 +180,29 @@ class RagQueryRequest(BaseModel):
     return_mode: str = "chunks"  # "chunks" or "pages"
 
 
+class IngestTextRequest(BaseModel):
+    """Request model for programmatic text ingestion."""
+    content: str
+    source_title: str
+    source_id: str | None = None
+    source_url: str | None = None
+    knowledge_type: str = "technical"
+    tags: list[str] = []
+    chunk_size: int = 5000
+    extract_code_examples: bool = False
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "content": "Your text content to ingest...",
+                "source_title": "My Documentation",
+                "knowledge_type": "technical",
+                "tags": ["api", "docs"],
+                "chunk_size": 5000,
+            }
+        }
+
+
 @router.get("/crawl-progress/{progress_id}")
 async def get_crawl_progress(progress_id: str):
     """Get crawl progress for polling.
@@ -1090,6 +1113,113 @@ async def _perform_upload_with_progress(
         if progress_id in active_crawl_tasks:
             del active_crawl_tasks[progress_id]
             safe_logfire_info(f"Cleaned up upload task from registry | progress_id={progress_id}")
+
+
+@router.post("/knowledge-items/ingest")
+async def ingest_text(request: IngestTextRequest):
+    """
+    Ingest raw text directly into the knowledge base.
+
+    This endpoint allows programmatic ingestion of text content without
+    requiring a file upload or URL crawl. Useful for:
+    - Ingesting LLM-generated content
+    - Importing pre-processed text
+    - Batch importing from external sources
+    - Synthesizing project documentation
+    """
+    # Validate required fields
+    if not request.content or not request.content.strip():
+        raise HTTPException(status_code=400, detail={"error": "content is required and cannot be empty"})
+
+    if not request.source_title or not request.source_title.strip():
+        raise HTTPException(status_code=400, detail={"error": "source_title is required and cannot be empty"})
+
+    # Validate content size (max 10MB)
+    if len(request.content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail={"error": "content exceeds maximum size of 10MB"})
+
+    # Validate chunk_size range
+    if request.chunk_size < 1000 or request.chunk_size > 10000:
+        raise HTTPException(status_code=400, detail={"error": "chunk_size must be between 1000 and 10000"})
+
+    # Validate API key before starting
+    logger.info("Validating API key for text ingestion...")
+    provider_config = await credential_service.get_active_provider("embedding")
+    provider = provider_config.get("provider", "openai")
+    await _validate_provider_api_key(provider)
+
+    try:
+        safe_logfire_info(
+            f"Starting text ingestion | source_title={request.source_title} | "
+            f"content_length={len(request.content)} | knowledge_type={request.knowledge_type}"
+        )
+
+        # Generate source_id if not provided
+        source_id = request.source_id
+        if not source_id:
+            # Create a hash-based ID from title + timestamp
+            import hashlib
+            hash_input = f"{request.source_title}_{datetime.now().isoformat()}"
+            source_id = f"ingest_{hashlib.sha256(hash_input.encode()).hexdigest()[:16]}"
+
+        # Use DocumentStorageService - same as file upload
+        doc_storage_service = DocumentStorageService(get_supabase_client())
+
+        # Call upload_document with the text content
+        # The service handles: chunking, embeddings, storage
+        success, result = await doc_storage_service.upload_document(
+            file_content=request.content,
+            filename=request.source_title,  # Use title as filename
+            source_id=source_id,
+            knowledge_type=request.knowledge_type,
+            tags=request.tags if request.tags else None,
+            extract_code_examples=request.extract_code_examples,
+            progress_callback=None,  # Synchronous ingestion, no progress tracking
+            cancellation_check=None,
+        )
+
+        if success:
+            safe_logfire_info(
+                f"Text ingestion successful | source_id={source_id} | "
+                f"chunks_stored={result.get('chunks_stored')} | "
+                f"word_count={result.get('word_count', 0)}"
+            )
+
+            # Update source_url if provided (override the file:// URL)
+            if request.source_url:
+                try:
+                    supabase = get_supabase_client()
+                    supabase.from_("archon_sources").update({
+                        "source_url": request.source_url,
+                        "metadata": {
+                            "knowledge_type": request.knowledge_type,
+                            "tags": request.tags,
+                            "source_type": "programmatic",
+                            "original_url": request.source_url,
+                        }
+                    }).eq("source_id", source_id).execute()
+                except Exception as e:
+                    logger.warning(f"Failed to update source_url: {e}")
+
+            return {
+                "success": True,
+                "source_id": source_id,
+                "chunks_stored": result.get("chunks_stored", 0),
+                "chunks_embedded": result.get("chunks_embedded", 0),
+                "word_count": result.get("word_count", 0),
+                "code_examples_stored": result.get("code_examples_stored", 0),
+                "message": f"Successfully ingested '{request.source_title}'"
+            }
+        else:
+            error_msg = result.get("error", "Ingestion failed")
+            safe_logfire_error(f"Text ingestion failed | error={error_msg}")
+            raise HTTPException(status_code=500, detail={"error": error_msg})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        safe_logfire_error(f"Text ingestion error | error={str(e)}")
+        raise HTTPException(status_code=500, detail={"error": f"Ingestion failed: {str(e)}"})
 
 
 @router.post("/knowledge-items/search")

@@ -357,5 +357,127 @@ def register_rag_tools(mcp: FastMCP):
             logger.error(f"Error reading page: {e}")
             return json.dumps({"success": False, "page": None, "error": str(e)}, indent=2)
 
+    @mcp.tool()
+    async def ingest_to_knowledge_base(
+        ctx: Context,
+        content: str,
+        source_title: str,
+        source_id: str | None = None,
+        source_url: str | None = None,
+        knowledge_type: str = "technical",
+        tags: list[str] | None = None,
+        chunk_size: int = 5000,
+        extract_code_examples: bool = False,
+    ) -> str:
+        """
+        Ingest raw text directly into the knowledge base.
+
+        Use this tool to programmatically add text content to the knowledge base
+        without requiring a file upload or URL crawl. Ideal for:
+        - Ingesting LLM-generated content or summaries
+        - Importing pre-processed documentation
+        - Adding project documentation or task summaries
+        - Batch importing from external sources
+
+        Args:
+            content: Raw text content to ingest (required, max 10MB)
+            source_title: Display name for the source (required, e.g., "Project Alpha Documentation")
+            source_id: Optional custom ID (auto-generated if not provided)
+            source_url: Optional reference URL for the content origin
+            knowledge_type: Type classification - "technical", "general", "code", or "guide" (default: "technical")
+            tags: Optional list of tags for filtering (e.g., ["api", "v2", "auth"])
+            chunk_size: Target chunk size in characters, 1000-10000 (default: 5000)
+            extract_code_examples: Whether to extract code blocks separately (default: false)
+
+        Returns:
+            JSON string with structure:
+            - success: bool - Operation success status
+            - source_id: str - ID of the created source (use for future queries)
+            - chunks_stored: int - Number of text chunks created
+            - chunks_embedded: int - Number of chunks with embeddings
+            - word_count: int - Total word count of ingested content
+            - message: str - Success message
+            - error: str|null - Error description if success=false
+
+        Example:
+            ingest_to_knowledge_base(
+                content="# API Documentation\\n\\nThis API provides...",
+                source_title="My API Docs v2",
+                knowledge_type="technical",
+                tags=["api", "documentation"]
+            )
+        """
+        try:
+            # Validate required fields
+            if not content or not content.strip():
+                return json.dumps(
+                    {"success": False, "error": "content is required and cannot be empty"},
+                    indent=2
+                )
+
+            if not source_title or not source_title.strip():
+                return json.dumps(
+                    {"success": False, "error": "source_title is required and cannot be empty"},
+                    indent=2
+                )
+
+            api_url = get_api_url()
+            timeout = httpx.Timeout(120.0, connect=10.0)  # Longer timeout for large content
+
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                request_data = {
+                    "content": content,
+                    "source_title": source_title,
+                    "knowledge_type": knowledge_type,
+                    "chunk_size": chunk_size,
+                    "extract_code_examples": extract_code_examples,
+                }
+
+                if source_id:
+                    request_data["source_id"] = source_id
+                if source_url:
+                    request_data["source_url"] = source_url
+                if tags:
+                    request_data["tags"] = tags
+
+                response = await client.post(
+                    urljoin(api_url, "/api/knowledge-items/ingest"),
+                    json=request_data
+                )
+
+                if response.status_code in (200, 201):
+                    result = response.json()
+                    return json.dumps(
+                        {
+                            "success": True,
+                            "source_id": result.get("source_id"),
+                            "chunks_stored": result.get("chunks_stored", 0),
+                            "chunks_embedded": result.get("chunks_embedded", 0),
+                            "word_count": result.get("word_count", 0),
+                            "message": result.get("message", "Content ingested successfully"),
+                            "error": None,
+                        },
+                        indent=2,
+                    )
+                else:
+                    error_detail = response.text
+                    try:
+                        error_json = response.json()
+                        error_detail = error_json.get("error", error_detail)
+                    except Exception:
+                        pass
+
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": f"HTTP {response.status_code}: {error_detail}",
+                        },
+                        indent=2,
+                    )
+
+        except Exception as e:
+            logger.error(f"Error ingesting content: {e}")
+            return json.dumps({"success": False, "error": str(e)}, indent=2)
+
     # Log successful registration
     logger.info("✓ RAG tools registered (HTTP-based version)")
